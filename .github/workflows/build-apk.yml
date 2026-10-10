@@ -69,19 +69,31 @@ jobs:
       # 以下为「可选」的正式签名包。
       # 只有在仓库 Settings → Secrets and variables → Actions 里配置了
       # KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
-      # 这 4 个 Secret 时才会执行，否则自动跳过。
+      # 这 4 个 Secret 时才会执行，否则自动跳过，不影响上面的 Debug 包。
+      #
+      # 注意：GitHub Actions 的 if 条件里不能直接引用 secrets 上下文，
+      # 所以这里把判定结果写进步骤输出（steps.keystore.outputs.enabled），
+      # 后续步骤再用 steps 上下文判断。
       # =================================================================
 
-      - name: 写入签名文件
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      - name: 准备签名文件（未配置 Secret 时自动跳过）
+        id: keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          mkdir -p signing
-          echo "$KEYSTORE_BASE64" | base64 --decode > signing/release.jks
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 KEYSTORE_BASE64，跳过正式签名包（Debug 包不受影响）"
+          else
+            mkdir -p signing
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > signing/release.jks
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "已写入签名文件："
+            ls -l signing/release.jks
+          fi
 
       - name: 编译签名 Release APK
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: steps.keystore.outputs.enabled == 'true'
         env:
           SIGNING_KEYSTORE: ${{ github.workspace }}/signing/release.jks
           SIGNING_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -93,7 +105,7 @@ jobs:
           ls -lh dist
 
       - name: 上传签名包
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: steps.keystore.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: jiehui-music-release
