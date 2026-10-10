@@ -9,9 +9,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.drawable.Icon;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
-import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -30,13 +27,20 @@ import android.os.PowerManager;
  * 音频就被掐断。挂上前台服务（带常驻通知）后，进程被提升为「前台进程」级别，
  * 系统不会冻结，音频得以持续播放。
  *
- * <p>另外三件事一起做了：
+ * <p>另外两件事一起做了：
  * <ul>
  *   <li>MediaSession：满足 Android 14 对 mediaPlayback 类型前台服务的要求，
  *       同时让锁屏 / 通知栏 / 耳机线控能控制播放。</li>
  *   <li>PARTIAL_WAKE_LOCK：息屏后 CPU 仍能跑，保证「一曲结束自动下一首」的逻辑不断。</li>
- *   <li>AudioFocus：来电话或别的 App 抢音频时自动暂停，结束后恢复。</li>
  * </ul>
+ *
+ * <p><b>⚠️ 这里刻意<b>不做</b> AudioFocus（音频焦点）管理，这是踩过的坑：</b>
+ * 安卓的音焦点是按「进程」划分的，而 WebView 的音频播放跑在独立的沙箱渲染进程里，
+ * Chromium 内部已经实现了完整的音焦点管理（来电话自动暂停、结束后恢复它自己会做）。
+ * 如果宿主 App 再去 requestAudioFocus(AUDIOFOCUS_GAIN)，系统会把 Chromium 那份焦点
+ * 判为 AUDIOFOCUS_LOSS，而 Chromium 收到 LOSS 的标准反应就是暂停 &lt;audio&gt; ——
+ * 表现为「点播放只响一下就被掐断、进度条不走」。
+ * 所以：WebView 音乐壳千万不要自己去抢音焦点。
  */
 public class PlaybackService extends Service {
 
@@ -46,6 +50,7 @@ public class PlaybackService extends Service {
     public static final String ACTION_TOGGLE = "com.jiehui.music.action.TOGGLE";
     public static final String ACTION_NEXT = "com.jiehui.music.action.NEXT";
     public static final String ACTION_PREV = "com.jiehui.music.action.PREV";
+    public static final String ACTION_DIAG = "com.jiehui.music.action.DIAG";
 
     // ---------- 下发给页面的 JS ----------
     // 页面里就是一个 <audio id="audio">，直接操作它最稳，不依赖页面内部函数作用域
@@ -60,6 +65,9 @@ public class PlaybackService extends Service {
             "(function(){var b=document.getElementById('nextBtn');if(b&&b.click)b.click();})()";
     public static final String JS_PREV =
             "(function(){var b=document.getElementById('prevBtn');if(b&&b.click)b.click();})()";
+    /** 切出页面内的诊断浮层（播放异常时用来查看音频元素真实状态） */
+    public static final String JS_TOGGLE_DIAG =
+            "(function(){if(window.__jhToggleDiag)window.__jhToggleDiag();})()";
 
     private static final String CHANNEL_ID = "jiehui_playback";
     private static final int NOTIFICATION_ID = 1001;
@@ -73,12 +81,8 @@ public class PlaybackService extends Service {
     private MediaSession mediaSession;
     private PowerManager.WakeLock wakeLock;
 
-    private AudioManager audioManager;
-    private AudioManager.OnAudioFocusChangeListener focusListener;
-
     private boolean foregroundStarted = false;
     private boolean playing = false;
-    private boolean resumeOnFocusGain = false;
     private String title = "";
     private String artist = "";
 
@@ -130,7 +134,6 @@ public class PlaybackService extends Service {
         createNotificationChannel();
         createWakeLock();
         createMediaSession();
-        initAudioFocus();
     }
 
     @Override
@@ -162,6 +165,9 @@ public class PlaybackService extends Service {
             case ACTION_PREV:
                 WebViewHolder.eval(JS_PREV);
                 break;
+            case ACTION_DIAG:
+                WebViewHolder.eval(JS_TOGGLE_DIAG);
+                break;
             case ACTION_START:
             default:
                 break;
@@ -187,7 +193,6 @@ public class PlaybackService extends Service {
     @Override
     public void onDestroy() {
         releaseWakeLock();
-        abandonAudioFocus();
         if (mediaSession != null) {
             try {
                 mediaSession.setActive(false);
@@ -257,6 +262,8 @@ public class PlaybackService extends Service {
                 new Intent(this, PlaybackService.class).setAction(ACTION_PREV), piFlags);
         PendingIntent nextIntent = PendingIntent.getService(this, 3,
                 new Intent(this, PlaybackService.class).setAction(ACTION_NEXT), piFlags);
+        PendingIntent diagIntent = PendingIntent.getService(this, 4,
+                new Intent(this, PlaybackService.class).setAction(ACTION_DIAG), piFlags);
 
         Notification.Builder builder = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 ? new Notification.Builder(this, CHANNEL_ID)
@@ -277,6 +284,8 @@ public class PlaybackService extends Service {
             builder.addAction(buildAction(playing ? R.drawable.ic_stat_pause : R.drawable.ic_stat_play,
                     getString(R.string.action_toggle), toggleIntent));
             builder.addAction(buildAction(R.drawable.ic_stat_next, getString(R.string.action_next), nextIntent));
+            // 第 4 个动作：展开通知才看得到，点一下在页面底部弹出播放状态诊断浮层
+            builder.addAction(buildAction(R.drawable.ic_stat_diag, getString(R.string.action_diag), diagIntent));
 
             builder.setStyle(new Notification.MediaStyle()
                     .setShowActionsInCompactView(0, 1, 2)
@@ -324,10 +333,8 @@ public class PlaybackService extends Service {
             return;
         }
 
+        // 注意：这里不申请音频焦点，交给 Chromium 自己管理（见类注释）
         updateMediaSession();
-        if (playing) {
-            requestAudioFocus();
-        }
         refreshNotification();
     }
 
@@ -433,98 +440,11 @@ public class PlaybackService extends Service {
     }
 
     // =====================================================================
-    // AudioFocus
-    // =====================================================================
-
-    private void initAudioFocus() {
-        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        if (audioManager == null) {
-            return;
-        }
-        focusListener = new AudioManager.OnAudioFocusChangeListener() {
-            @Override
-            public void onAudioFocusChange(int change) {
-                switch (change) {
-                    case AudioManager.AUDIOFOCUS_LOSS:
-                        // 被别的 App 永久抢占（如另一款音乐播放器）
-                        resumeOnFocusGain = false;
-                        if (playing) {
-                            WebViewHolder.eval(JS_PAUSE);
-                        }
-                        break;
-                    case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
-                        // 来电等临时打断，结束后恢复
-                        resumeOnFocusGain = playing;
-                        if (playing) {
-                            WebViewHolder.eval(JS_PAUSE);
-                        }
-                        break;
-                    case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
-                        // 允许降低音量继续播放，交给系统处理
-                        break;
-                    case AudioManager.AUDIOFOCUS_GAIN:
-                        if (resumeOnFocusGain) {
-                            WebViewHolder.eval(JS_PLAY);
-                        }
-                        resumeOnFocusGain = false;
-                        break;
-                    default:
-                        break;
-                }
-            }
-        };
-    }
-
-    private void requestAudioFocus() {
-        if (audioManager == null || focusListener == null) {
-            return;
-        }
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                AudioFocusRequest request = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                .build())
-                        .setOnAudioFocusChangeListener(focusListener)
-                        .build();
-                audioManager.requestAudioFocus(request);
-            } else {
-                audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC,
-                        AudioManager.AUDIOFOCUS_GAIN);
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void abandonAudioFocus() {
-        if (audioManager == null || focusListener == null) {
-            return;
-        }
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                AudioFocusRequest request = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                .build())
-                        .setOnAudioFocusChangeListener(focusListener)
-                        .build();
-                audioManager.abandonAudioFocusRequest(request);
-            } else {
-                audioManager.abandonAudioFocus(focusListener);
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    // =====================================================================
     // 收尾
     // =====================================================================
 
     private void stopPlayback() {
         releaseWakeLock();
-        abandonAudioFocus();
         if (mediaSession != null) {
             try {
                 mediaSession.setActive(false);

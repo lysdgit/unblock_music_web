@@ -9,6 +9,7 @@
     <string name="action_prev">上一首</string>
     <string name="action_toggle">播放/暂停</string>
     <string name="action_next">下一首</string>
+    <string name="action_diag">诊断</string>
 
     <!-- 引导 -->
     <string name="back_hint">已退到后台继续播放；从「最近任务」划掉可完全退出</string>

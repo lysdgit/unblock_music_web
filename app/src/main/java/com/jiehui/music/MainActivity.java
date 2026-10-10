@@ -163,10 +163,14 @@ public class MainActivity extends Activity {
         // 音源直链常见 http 地址，必须放开混合内容，否则播放失败
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
 
-        // 去掉 UA 里的 "; wv" 标记，尽量以普通 Chrome 身份请求，兼容性更好
+        // 去掉 UA 里的 "; wv" 和 "Version/4.0"，尽量以普通 Chrome 身份请求，
+        // 避免部分音源/后端对 WebView 做特殊处理
         String ua = settings.getUserAgentString();
-        if (ua != null && ua.contains("; wv")) {
-            settings.setUserAgentString(ua.replace("; wv", ""));
+        if (ua != null) {
+            String patched = ua.replace("; wv", "").replace("Version/4.0 ", "");
+            if (!patched.equals(ua)) {
+                settings.setUserAgentString(patched);
+            }
         }
 
         CookieManager cookieManager = CookieManager.getInstance();
@@ -240,7 +244,7 @@ public class MainActivity extends Activity {
     // =====================================================================
 
     /**
-     * 注入到页面的监听脚本：页面里的 <audio> 一旦播放 / 暂停 / 换曲，
+     * 注入到页面的监听脚本：页面里的 &lt;audio&gt; 一旦播放 / 暂停 / 换曲，
      * 就通过 AndroidHost 把状态回传给前台服务，用于刷新通知栏和媒体会话。
      */
     private static final String BRIDGE_JS =
@@ -249,9 +253,12 @@ public class MainActivity extends Activity {
                     + "var a=document.getElementById('audio');"
                     + "if(!a){setTimeout(function(){window.__jhHooked=false;},1000);return;}"
                     + "window.__jhHooked=true;"
+                    + "var last='';"
                     + "function report(){"
                     + "  try{"
                     + "    var md=(navigator.mediaSession&&navigator.mediaSession.metadata)||null;"
+                    + "    var k=(a.paused?'0':'1')+'|'+(md?(md.title||''):'')+'|'+(md?(md.artist||''):'');"
+                    + "    if(k===last)return; last=k;"
                     + "    AndroidHost.onState(!a.paused, md?(md.title||''):'', md?(md.artist||''):'');"
                     + "  }catch(e){}"
                     + "}"
@@ -260,8 +267,55 @@ public class MainActivity extends Activity {
                     + "report();"
                     + "})();";
 
+    /**
+     * 排障用浮层：长按页面 1.5 秒（或点通知栏「诊断」）在页面底部切出一块
+     * 实时状态面板，直接显示 &lt;audio&gt; 的 paused / readyState / networkState /
+     * error.code / 时长 / 音量 等，以及页面里的 JS 报错。
+     * 播放异常时截个图就能定位，不用连 adb 抓 logcat。
+     */
+    private static final String DIAG_JS =
+            "(function(){"
+                    + "if(window.__jhDiagReady)return;window.__jhDiagReady=true;"
+                    + "var box=null,timer=null,logs=[];"
+                    + "function paint(){"
+                    + "  if(!box)return;"
+                    + "  var a=document.getElementById('audio'),s='';"
+                    + "  if(a){"
+                    + "    s+='paused='+a.paused+'   t='+a.currentTime.toFixed(2)+'/'+(isFinite(a.duration)?a.duration.toFixed(1):'Inf')+'\\n';"
+                    + "    s+='readyState='+a.readyState+'  networkState='+a.networkState+'  error='+(a.error?a.error.code:'-')+'\\n';"
+                    + "    s+='volume='+a.volume+'  muted='+a.muted+'  rate='+a.playbackRate+'\\n';"
+                    + "    s+='src='+String(a.currentSrc||'-').replace(/^https?:\\/\\//,'').slice(0,62)+'\\n';"
+                    + "  }else{s+='#audio 未找到\\n';}"
+                    + "  s+='mediaSession='+('mediaSession' in navigator)+'\\n';"
+                    + "  s+='UA='+navigator.userAgent.slice(-48)+'\\n';"
+                    + "  if(logs.length)s+='--- 日志 ---\\n'+logs.join('\\n')+'\\n';"
+                    + "  s+='【长按页面1.5秒 或 通知栏「诊断」关闭】';"
+                    + "  box.textContent=s;"
+                    + "}"
+                    + "function add(m){"
+                    + "  logs.push(new Date().toTimeString().slice(0,8)+' '+m);"
+                    + "  if(logs.length>6)logs.shift();"
+                    + "  paint();"
+                    + "  try{AndroidHost.onDiag(m);}catch(e){}"
+                    + "}"
+                    + "window.addEventListener('error',function(e){add('ERR '+(e.message||'')+' @'+String(e.filename||'').split('/').pop()+':'+(e.lineno||''));});"
+                    + "window.addEventListener('unhandledrejection',function(e){add('REJ '+((e.reason&&e.reason.message)||e.reason));});"
+                    + "window.__jhToggleDiag=function(){"
+                    + "  if(box){clearInterval(timer);timer=null;box.remove();box=null;return;}"
+                    + "  box=document.createElement('div');"
+                    + "  box.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:2147483647;"
+                    + "background:rgba(0,0,0,.88);color:#66e28a;font:11px/1.5 monospace;padding:8px 10px;"
+                    + "white-space:pre-wrap;word-break:break-all;max-height:55%;overflow:auto';"
+                    + "  document.body.appendChild(box);"
+                    + "  paint();timer=setInterval(paint,500);"
+                    + "};"
+                    + "var t0=0;"
+                    + "document.addEventListener('touchstart',function(){t0=Date.now();},true);"
+                    + "document.addEventListener('touchend',function(){if(Date.now()-t0>1500)window.__jhToggleDiag();},true);"
+                    + "})();";
+
     private void injectBridge(WebView view) {
-        view.evaluateJavascript(BRIDGE_JS, null);
+        view.evaluateJavascript(BRIDGE_JS + DIAG_JS, null);
     }
 
     /** 暴露给页面的原生接口 */
@@ -269,6 +323,11 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void onState(final boolean playing, final String title, final String artist) {
             PlaybackService.updateState(playing, title, artist);
+        }
+
+        @JavascriptInterface
+        public void onDiag(String message) {
+            android.util.Log.w("JieHuiMusic", "[page] " + message);
         }
     }
 
