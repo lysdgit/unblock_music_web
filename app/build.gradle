@@ -1,0 +1,64 @@
+plugins {
+    id 'com.android.application'
+}
+
+// 可选的 release 签名：只有在环境变量里提供了 keystore 时才启用
+// GitHub Actions 里通过仓库 Secrets 注入这 4 个变量即可产出正式签名包
+def signingKeystore = System.getenv("SIGNING_KEYSTORE")
+
+android {
+    namespace 'com.jiehui.music'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.jiehui.music"
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    if (signingKeystore != null && !signingKeystore.isEmpty()) {
+        signingConfigs {
+            release {
+                storeFile file(signingKeystore)
+                storePassword System.getenv("SIGNING_STORE_PASSWORD")
+                keyAlias System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword System.getenv("SIGNING_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            shrinkResources false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (signingKeystore != null && !signingKeystore.isEmpty()) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 关闭 BuildConfig 生成，这个壳工程用不到
+    buildFeatures {
+        buildConfig false
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // 纯平台 API 实现，不引入任何 androidx 依赖 —— 编译更快、故障点更少
+}

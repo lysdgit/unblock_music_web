@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#FF0F1115</color>
+    <color name="accent">#FF4F8CFF</color>
+    <!-- 自适应图标背景色（与站点主题一致） -->
+    <color name="ic_launcher_background">#FF1B2A4A</color>
+</resources>

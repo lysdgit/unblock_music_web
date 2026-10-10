@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">解灰音乐</string>
+
+    <!-- 通知栏 -->
+    <string name="channel_name">后台播放</string>
+    <string name="channel_desc">保持音乐在后台持续播放</string>
+    <string name="notification_idle">已就绪，打开应用选择歌曲</string>
+    <string name="action_prev">上一首</string>
+    <string name="action_toggle">播放/暂停</string>
+    <string name="action_next">下一首</string>
+
+    <!-- 引导 -->
+    <string name="back_hint">已退到后台继续播放；从「最近任务」划掉可完全退出</string>
+    <string name="battery_title">允许后台持续播放</string>
+    <string name="battery_message">为了让音乐在锁屏 / 后台长时间播放不被系统中断，建议将本应用加入「电池优化白名单」。\n\n点击「去设置」，在列表中找到本应用并选择「不优化 / 允许后台运行」。</string>
+    <string name="battery_ok">去设置</string>
+    <string name="battery_later">以后再说</string>
+</resources>
