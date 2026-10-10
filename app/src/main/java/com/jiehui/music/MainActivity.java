@@ -244,8 +244,22 @@ public class MainActivity extends Activity {
     // =====================================================================
 
     /**
-     * 注入到页面的监听脚本：页面里的 &lt;audio&gt; 一旦播放 / 暂停 / 换曲，
-     * 就通过 AndroidHost 把状态回传给前台服务，用于刷新通知栏和媒体会话。
+     * 注入到页面的监听脚本：把「正在播放哪首歌」回传给前台服务，
+     * 用于刷新通知栏卡片（歌名 / 歌手 / 封面）与锁屏媒体会话。
+     *
+     * <p>取歌曲信息的优先级（多级兜底，站点改版也不容易失效）：
+     * <ol>
+     *   <li>{@code navigator.mediaSession.metadata} —— 站点自己设置的 title / artist / artwork；</li>
+     *   <li>页面 DOM 的 {@code #nowName / #nowArtist / #nowCover} —— 播放器正在显示的歌曲信息；</li>
+     * </ol>
+     *
+     * <p>上报分两路：
+     * <ul>
+     *   <li>{@code onState(播放中, 歌名, 歌手, 封面, 总时长)} —— 只在信息真正变化时上报（换歌 / 播放暂停），
+     *       触发通知栏重建；</li>
+     *   <li>{@code onTick(当前位置, 总时长)} —— 每秒上报，用于让 Android 10+ 媒体卡片的进度条走起来，
+     *       不会重建通知，开销极小。</li>
+     * </ul>
      */
     private static final String BRIDGE_JS =
             "(function(){"
@@ -253,17 +267,39 @@ public class MainActivity extends Activity {
                     + "var a=document.getElementById('audio');"
                     + "if(!a){setTimeout(function(){window.__jhHooked=false;},1000);return;}"
                     + "window.__jhHooked=true;"
+                    + "function txt(id){var e=document.getElementById(id);return e?String(e.textContent||'').trim():'';}"
+                    + "function pick(){"
+                    + "  var t='',ar='',cov='';"
+                    + "  var md=(navigator.mediaSession&&navigator.mediaSession.metadata)||null;"
+                    + "  if(md){"
+                    + "    t=md.title||''; ar=md.artist||'';"
+                    + "    if(md.artwork&&md.artwork.length){cov=md.artwork[md.artwork.length-1].src||'';}"
+                    + "  }"
+                    + "  if(!t)t=txt('nowName');"
+                    + "  if(!ar)ar=txt('nowArtist');"
+                    + "  if(!cov){var c=document.getElementById('nowCover');if(c&&c.getAttribute('src'))cov=c.src;}"
+                    + "  if(t==='未在播放')t='';"
+                    + "  if(ar==='—')ar='';"
+                    + "  if(t==='解灰音乐'||t==='JieHuiMusic')t='';"
+                    + "  return t+'\\u0001'+ar+'\\u0001'+cov;"
+                    + "}"
                     + "var last='';"
                     + "function report(){"
                     + "  try{"
-                    + "    var md=(navigator.mediaSession&&navigator.mediaSession.metadata)||null;"
-                    + "    var k=(a.paused?'0':'1')+'|'+(md?(md.title||''):'')+'|'+(md?(md.artist||''):'');"
-                    + "    if(k===last)return; last=k;"
-                    + "    AndroidHost.onState(!a.paused, md?(md.title||''):'', md?(md.artist||''):'');"
+                    + "    var p=pick();"
+                    + "    var d=(isFinite(a.duration)&&a.duration>0)?Math.round(a.duration*1000):0;"
+                    + "    var k=(a.paused?'0':'1')+'|'+p+'|'+d;"
+                    + "    if(k!==last){"
+                    + "      last=k;"
+                    + "      var q=p.split('\\u0001');"
+                    + "      AndroidHost.onState(!a.paused,q[0]||'',q[1]||'',q[2]||'',d);"
+                    + "    }"
+                    + "    AndroidHost.onTick(Math.round((a.currentTime||0)*1000),d);"
                     + "  }catch(e){}"
                     + "}"
-                    + "['play','pause','playing','ended','loadedmetadata','emptied'].forEach(function(ev){a.addEventListener(ev,report);});"
-                    + "setInterval(report,1500);"
+                    + "['play','pause','playing','ended','loadedmetadata','emptied','durationchange']"
+                    + ".forEach(function(ev){a.addEventListener(ev,report);});"
+                    + "setInterval(report,1000);"
                     + "report();"
                     + "})();";
 
@@ -320,9 +356,17 @@ public class MainActivity extends Activity {
 
     /** 暴露给页面的原生接口 */
     public class NativeBridge {
+        /** 歌曲级信息变化（换歌 / 播放暂停 / 封面变化），触发通知栏重建 */
         @JavascriptInterface
-        public void onState(final boolean playing, final String title, final String artist) {
-            PlaybackService.updateState(playing, title, artist);
+        public void onState(final boolean playing, final String title, final String artist,
+                            final String cover, final int durationMs) {
+            PlaybackService.updateState(playing, title, artist, cover, durationMs);
+        }
+
+        /** 每秒一次的位置上报，只用于刷新媒体会话进度，不重建通知 */
+        @JavascriptInterface
+        public void onTick(final int positionMs, final int durationMs) {
+            PlaybackService.updateProgress(positionMs, durationMs);
         }
 
         @JavascriptInterface

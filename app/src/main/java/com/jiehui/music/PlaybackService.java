@@ -8,6 +8,8 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
@@ -18,6 +20,13 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 /**
  * 媒体前台服务 —— 本工程解决「后台播放几分钟就自动暂停」的核心。
  *
@@ -27,11 +36,12 @@ import android.os.PowerManager;
  * 音频就被掐断。挂上前台服务（带常驻通知）后，进程被提升为「前台进程」级别，
  * 系统不会冻结，音频得以持续播放。
  *
- * <p>另外两件事一起做了：
+ * <p>另外三件事一起做了：
  * <ul>
  *   <li>MediaSession：满足 Android 14 对 mediaPlayback 类型前台服务的要求，
- *       同时让锁屏 / 通知栏 / 耳机线控能控制播放。</li>
+ *       同时让锁屏 / 通知栏 / 耳机线控能控制播放，并让媒体卡片显示歌曲信息与封面。</li>
  *   <li>PARTIAL_WAKE_LOCK：息屏后 CPU 仍能跑，保证「一曲结束自动下一首」的逻辑不断。</li>
+ *   <li>封面图异步下载：把页面里的封面地址抓成 Bitmap，填进通知栏大图标与媒体元数据。</li>
  * </ul>
  *
  * <p><b>⚠️ 这里刻意<b>不做</b> AudioFocus（音频焦点）管理，这是踩过的坑：</b>
@@ -81,10 +91,23 @@ public class PlaybackService extends Service {
     private MediaSession mediaSession;
     private PowerManager.WakeLock wakeLock;
 
+    /** 封面下载线程（单线程串行，避免连点切歌时并发下载） */
+    private ExecutorService coverExecutor;
+    /** url -> Bitmap 内存缓存，避免每首歌来回切时重复下载 */
+    private final java.util.HashMap<String, Bitmap> coverCache = new java.util.HashMap<>();
+
     private boolean foregroundStarted = false;
     private boolean playing = false;
     private String title = "";
     private String artist = "";
+    /** 当前这首歌的封面地址（用于判断是否需要重新下载） */
+    private String coverUrl = "";
+    /** 已经"处理过"的封面地址：下载中 / 下载完成 / 下载失败都算处理过，避免重复提交任务 */
+    private String coverHandledUrl = "";
+    /** 当前显示用的大图标 */
+    private Bitmap coverBitmap;
+    private int durationMs = 0;
+    private int positionMs = 0;
 
     // =====================================================================
     // 对外静态入口
@@ -105,10 +128,11 @@ public class PlaybackService extends Service {
     }
 
     /**
-     * 页面通过 JS 桥上报播放状态，用于刷新通知栏与媒体会话。
-     * 该方法可能运行在 WebView 的 JS 线程，必须切回主线程。
+     * 页面通过 JS 桥上报「歌曲级」状态（播/停、歌名、歌手、封面、总时长），
+     * 用于刷新通知栏与媒体会话。该方法可能运行在 WebView 的 JS 线程，必须切回主线程。
      */
-    public static void updateState(final boolean isPlaying, final String newTitle, final String newArtist) {
+    public static void updateState(final boolean isPlaying, final String newTitle,
+                                   final String newArtist, final String newCover, final int newDurationMs) {
         final PlaybackService service = sInstance;
         if (service == null) {
             return;
@@ -116,7 +140,25 @@ public class PlaybackService extends Service {
         service.mainHandler.post(new Runnable() {
             @Override
             public void run() {
-                service.applyState(isPlaying, newTitle, newArtist);
+                service.applyState(isPlaying, newTitle, newArtist, newCover, newDurationMs);
+            }
+        });
+    }
+
+    /**
+     * 页面每秒上报一次的播放进度（毫秒）。
+     * 只更新 MediaSession 的 PlaybackState（让 Android 10+ 媒体卡片的进度条、锁屏时间走起来），
+     * <b>不重建通知</b>，避免每秒刷一次通知。
+     */
+    public static void updateProgress(final int newPositionMs, final int newDurationMs) {
+        final PlaybackService service = sInstance;
+        if (service == null) {
+            return;
+        }
+        service.mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                service.applyProgress(newPositionMs, newDurationMs);
             }
         });
     }
@@ -131,6 +173,7 @@ public class PlaybackService extends Service {
         sInstance = this;
 
         notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        coverExecutor = Executors.newSingleThreadExecutor();
         createNotificationChannel();
         createWakeLock();
         createMediaSession();
@@ -193,6 +236,13 @@ public class PlaybackService extends Service {
     @Override
     public void onDestroy() {
         releaseWakeLock();
+        if (coverExecutor != null) {
+            coverExecutor.shutdownNow();
+            coverExecutor = null;
+        }
+        synchronized (coverCache) {
+            coverCache.clear();
+        }
         if (mediaSession != null) {
             try {
                 mediaSession.setActive(false);
@@ -269,15 +319,25 @@ public class PlaybackService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
 
+        // 有歌名就显示歌名，否则显示应用名；副标题显示歌手，没在播时给一句提示。
+        // 这两行就是通知栏卡片上的文字（缩起状态 / 锁屏同样读这两个字段）。
         builder.setSmallIcon(R.drawable.ic_stat_music)
                 .setContentTitle(title.isEmpty() ? getString(R.string.app_name) : title)
-                .setContentText(artist.isEmpty() ? getString(R.string.notification_idle) : artist)
+                .setContentText(artist.isEmpty()
+                        ? (title.isEmpty() ? getString(R.string.notification_idle)
+                        : getString(R.string.notification_unknown_artist))
+                        : artist)
                 .setContentIntent(contentIntent)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setShowWhen(false)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setPriority(Notification.PRIORITY_LOW);
+
+        // 展开通知后显示封面大图（缩起状态不显示，属系统行为）
+        if (coverBitmap != null && !coverBitmap.isRecycled()) {
+            builder.setLargeIcon(coverBitmap);
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && mediaSession != null) {
             builder.addAction(buildAction(R.drawable.ic_stat_prev, getString(R.string.action_prev), prevIntent));
@@ -317,18 +377,31 @@ public class PlaybackService extends Service {
     // 状态同步（由页面 JS 上报驱动）
     // =====================================================================
 
-    private void applyState(boolean isPlaying, String newTitle, String newArtist) {
+    private void applyState(boolean isPlaying, String newTitle, String newArtist,
+                            String newCover, int newDurationMs) {
         boolean changed = (isPlaying != playing);
         playing = isPlaying;
 
-        if (newTitle != null && !newTitle.isEmpty() && !newTitle.equals(title)) {
+        if (newTitle != null && !newTitle.equals(title)) {
             title = newTitle;
             changed = true;
         }
-        if (newArtist != null && !newArtist.isEmpty() && !newArtist.equals(artist)) {
+        if (newArtist != null && !newArtist.equals(artist)) {
             artist = newArtist;
             changed = true;
         }
+        if (newDurationMs > 0 && newDurationMs != durationMs) {
+            durationMs = newDurationMs;
+            changed = true;
+        }
+
+        String newCover2 = newCover == null ? "" : newCover;
+        if (!newCover2.equals(coverUrl)) {
+            coverUrl = newCover2;
+            changed = true;
+            loadCover(newCover2);      // 异步下载，完成后自行刷新通知
+        }
+
         if (!changed) {
             return;
         }
@@ -336,6 +409,137 @@ public class PlaybackService extends Service {
         // 注意：这里不申请音频焦点，交给 Chromium 自己管理（见类注释）
         updateMediaSession();
         refreshNotification();
+    }
+
+    /** 纯进度更新：只动 PlaybackState，不重建通知 */
+    private void applyProgress(int newPositionMs, int newDurationMs) {
+        boolean changed = false;
+        if (Math.abs(newPositionMs - positionMs) >= 1000) {
+            positionMs = newPositionMs;
+            changed = true;
+        }
+        if (newDurationMs > 0 && newDurationMs != durationMs) {
+            durationMs = newDurationMs;
+            changed = true;
+        }
+        if (changed) {
+            updateMediaSession();
+        }
+    }
+
+    // =====================================================================
+    // 封面下载（纯 HttpURLConnection，不引入任何第三方库）
+    // =====================================================================
+
+    private void loadCover(String url) {
+        if (url == null || url.isEmpty()) {
+            coverBitmap = null;
+            coverHandledUrl = "";
+            return;
+        }
+        if (url.equals(coverHandledUrl)) {
+            return;   // 同一首已经处理过（下载中/成功/失败），不重复提交
+        }
+        coverHandledUrl = url;
+
+        Bitmap cached;
+        synchronized (coverCache) {
+            cached = coverCache.get(url);
+        }
+        if (cached != null && !cached.isRecycled()) {
+            coverBitmap = cached;
+            updateMediaSession();
+            refreshNotification();
+            return;
+        }
+
+        coverBitmap = null;
+        if (coverExecutor == null || coverExecutor.isShutdown()) {
+            return;
+        }
+        coverExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                final Bitmap bitmap = fetchBitmap(url);
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        // 下载期间可能已经切歌了，丢弃过期结果
+                        if (!url.equals(coverUrl)) {
+                            return;
+                        }
+                        if (bitmap != null) {
+                            synchronized (coverCache) {
+                                if (coverCache.size() > 20) {
+                                    coverCache.clear();
+                                }
+                                coverCache.put(url, bitmap);
+                            }
+                            coverBitmap = bitmap;
+                            updateMediaSession();
+                            refreshNotification();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /** 下载并解码封面；失败返回 null（通知栏只是没有大图，不影响播放） */
+    private Bitmap fetchBitmap(String url) {
+        HttpURLConnection conn = null;
+        InputStream in = null;
+        try {
+            URL u = new URL(url);
+            conn = (HttpURLConnection) u.openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(8000);
+            conn.setInstanceFollowRedirects(true);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android)");
+            conn.setRequestProperty("Accept", "image/*");
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                return null;
+            }
+            in = conn.getInputStream();
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n, total = 0;
+            while ((n = in.read(buf)) > 0) {
+                total += n;
+                if (total > 4 * 1024 * 1024) {
+                    break;   // 封面不至于超过 4MB，兜底防爆内存
+                }
+                bos.write(buf, 0, n);
+            }
+            byte[] data = bos.toByteArray();
+            if (data.length == 0) {
+                return null;
+            }
+
+            BitmapFactory.Options probe = new BitmapFactory.Options();
+            probe.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(data, 0, data.length, probe);
+            int sample = 1;
+            while (probe.outWidth / sample > 512 || probe.outHeight / sample > 512) {
+                sample *= 2;
+            }
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = sample;
+            return BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
     }
 
     // =====================================================================
@@ -374,6 +578,14 @@ public class PlaybackService extends Service {
             public void onSkipToPrevious() {
                 WebViewHolder.eval(JS_PREV);
             }
+
+            @Override
+            public void onSeekTo(long pos) {
+                // 支持在通知栏 / 锁屏上拖动进度条 —— 直接改页面 <audio> 的 currentTime
+                double seconds = pos / 1000.0;
+                WebViewHolder.eval("(function(){var a=document.getElementById('audio');"
+                        + "if(a){try{a.currentTime=" + seconds + ";}catch(e){}}})()");
+            }
         });
         mediaSession.setActive(true);
         updateMediaSession();
@@ -388,22 +600,34 @@ public class PlaybackService extends Service {
                 | PlaybackState.ACTION_PLAY_PAUSE
                 | PlaybackState.ACTION_SKIP_TO_NEXT
                 | PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                | PlaybackState.ACTION_SEEK_TO
                 | PlaybackState.ACTION_STOP;
 
+        // 带真实播放位置：Android 10+ 的媒体卡片会据此显示可拖动的进度条
         PlaybackState state = new PlaybackState.Builder()
                 .setActions(actions)
                 .setState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
-                        PlaybackState.PLAYBACK_POSITION_UNKNOWN,
+                        durationMs > 0 ? positionMs : PlaybackState.PLAYBACK_POSITION_UNKNOWN,
                         playing ? 1f : 0f)
                 .build();
         mediaSession.setPlaybackState(state);
 
-        if (!title.isEmpty()) {
-            MediaMetadata metadata = new MediaMetadata.Builder()
-                    .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                    .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
-                    .build();
-            mediaSession.setMetadata(metadata);
+        MediaMetadata.Builder meta = new MediaMetadata.Builder();
+        meta.putString(MediaMetadata.METADATA_KEY_TITLE,
+                title.isEmpty() ? getString(R.string.app_name) : title);
+        if (!artist.isEmpty()) {
+            meta.putString(MediaMetadata.METADATA_KEY_ARTIST, artist);
+        }
+        if (durationMs > 0) {
+            meta.putLong(MediaMetadata.METADATA_KEY_DURATION, durationMs);
+        }
+        if (coverBitmap != null && !coverBitmap.isRecycled()) {
+            // 锁屏 / 车载 / Android 13+ 媒体卡片读的是这个封面
+            meta.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, coverBitmap);
+        }
+        try {
+            mediaSession.setMetadata(meta.build());
+        } catch (Throwable ignored) {
         }
     }
 

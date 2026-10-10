@@ -6,6 +6,7 @@
     <string name="channel_name">后台播放</string>
     <string name="channel_desc">保持音乐在后台持续播放</string>
     <string name="notification_idle">已就绪，打开应用选择歌曲</string>
+    <string name="notification_unknown_artist">未知歌手</string>
     <string name="action_prev">上一首</string>
     <string name="action_toggle">播放/暂停</string>
     <string name="action_next">下一首</string>
